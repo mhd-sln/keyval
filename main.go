@@ -12,7 +12,7 @@ import (
 )
 
 type KeyValue struct {
-	InMem   map[string]string
+	InMem   map[string][]string
 	version int
 	stores  store
 }
@@ -42,10 +42,19 @@ func (kv *KeyValue) handler(w http.ResponseWriter, r *http.Request) {
 		queries := r.URL.Query()
 		for qKey, qValue := range queries {
 			// The value is the latest value, shall we combine all the values
-			valueLen := len(qValue)
-			kv.InMem[qKey] = qValue[valueLen-1]
+			currVal := kv.InMem[qKey]
+			kv.InMem[qKey] = append(currVal, qValue...)
 		}
-		//err := ioutil.WriteFile("keyvalue.json", data, 0644)
+		f, err := os.Create(kv.stores.filename())
+		err = kv.stores.encode(f, &kv.InMem)
+		if err != nil {
+			fmt.Println(err)
+		}
+	case "PUT":
+		queries := r.URL.Query()
+		for qKey, qValue := range queries {
+			kv.InMem[qKey] = qValue
+		}
 		f, err := os.Create(kv.stores.filename())
 		err = kv.stores.encode(f, &kv.InMem)
 		if err != nil {
@@ -73,7 +82,7 @@ func (jsonstore) encode(w io.Writer, data interface{}) error {
 
 func NewKeyValue() *KeyValue {
 	var k KeyValue
-	k.InMem = make(map[string]string)
+	k.InMem = make(map[string][]string)
 	return &k
 }
 

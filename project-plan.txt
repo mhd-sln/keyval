@@ -1,11 +1,13 @@
 KEY-VALUE STORE IMPLEMENTATION (get/set) (etcd)
 
-Rest API
-- response to http on local port. net/http pkg.
-- post/put value to a location(uri).
-- get (read) from a location(uri).
+FEATURES:
+---------
+- Post a key-value. Stores it to a file and in-memory. File storage is JSON and GOB // STATUS: DONE
+- Get (read) from a key. // STATUS: DONE
+- Update a key-value by using the PUT. // STATUS: ONGOING
 
-
+NOTES:
+-----
 https://web.eecs.utk.edu/~azh/blog/morechallengingprojects.html
 
 persistant
@@ -13,7 +15,6 @@ https://golang.org/pkg/encoding/gob/
 https://golang.org/pkg/encoding/json/
 
 choose the storage backend. we would need some kind of configuration. ability to change the backend without service restart ?
-
 
 Questions for the sessions
 
