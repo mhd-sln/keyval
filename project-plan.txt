@@ -1,0 +1,22 @@
+KEY-VALUE STORE IMPLEMENTATION (get/set) (etcd)
+
+Rest API
+- response to http on local port. net/http pkg.
+- post/put value to a location(uri).
+- get (read) from a location(uri).
+
+
+https://web.eecs.utk.edu/~azh/blog/morechallengingprojects.html
+
+persistant
+https://golang.org/pkg/encoding/gob/
+https://golang.org/pkg/encoding/json/
+
+choose the storage backend. we would need some kind of configuration. ability to change the backend without service restart ?
+
+
+Questions for the sessions
+
+- should the json file have one key one value or if one key has multiple values then should it be a combo of all the values. Currently its only the latest value
+
+
