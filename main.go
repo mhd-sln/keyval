@@ -3,43 +3,52 @@ package main
 import (
 	"encoding/gob"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
+
+	"github.com/hashicorp/raft"
+	"github.com/hashicorp/raft-boltdb"
 )
 
 type KeyValue struct {
 	InMem   map[string][]string
 	version int
 	stores  store
-}
-
-type Message struct {
-	Key   string
-	Value string
+	mu      sync.Mutex
 }
 
 func (kv *KeyValue) load() error {
+	kv.mu.Lock()
 	f, err := os.Open(kv.stores.filename())
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	kv.version = 1000
+	defer kv.mu.Unlock()
 
-	return kv.stores.decode(f, &kv.InMem)
+	kv.version = 1000
+	err = kv.stores.decode(f, &kv.InMem)
+
+	return err
 }
 
 func (kv *KeyValue) handler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case "GET":
+		kv.mu.Lock()
+		defer kv.mu.Unlock()
 		value := kv.InMem[strings.Trim(r.URL.Path, "/")]
 		fmt.Fprintf(w, "Value = %s", value)
 	case "POST":
 		queries := r.URL.Query()
+		kv.mu.Lock()
+		defer kv.mu.Unlock()
 		for qKey, qValue := range queries {
 			// The value is the latest value, shall we combine all the values
 			currVal := kv.InMem[qKey]
@@ -52,6 +61,9 @@ func (kv *KeyValue) handler(w http.ResponseWriter, r *http.Request) {
 		}
 	case "PUT":
 		queries := r.URL.Query()
+		kv.mu.Lock()
+		kv.mu.Unlock()
+
 		for qKey, qValue := range queries {
 			kv.InMem[qKey] = qValue
 		}
@@ -60,6 +72,8 @@ func (kv *KeyValue) handler(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			fmt.Println(err)
 		}
+	case "DELETE":
+		// todo
 	default:
 		fmt.Fprintf(w, "Sorry, only GET and POST methods are supported.")
 	}
@@ -108,8 +122,48 @@ type store interface {
 	filename() string
 }
 
+type Store struct {
+	RaftDir  string
+	RaftBind string
+	inmem    bool
+
+	mu sync.Mutex
+	m  map[string]string // The key-value store for the system.
+
+	raft *raft.Raft // The consensus mechanism
+
+	logger *log.Logger
+}
+
+func New(inmem bool) *Store {
+	return &Store{
+		m:      make(map[string]string),
+		inmem:  inmem,
+		logger: log.New(os.Stderr, "[store] ", log.LstdFlags),
+	}
+}
+
+func (s *Store) Open(enableSingle bool, localID string) error {
+	config := raft.DefaultConfig()
+	config.LocalID = raft.ServerID("123")
+
+	boltDB, err := raftboltdb.NewBoltStore(filepath.Join("/Users/salmanmanekia/dev/jaywren-golang/keyval", "raft.db"))
+	if err != nil {
+		fmt.Errorf("new bolt store: %s", err)
+	}
+	logStore := boltDB
+	stableStore := boltDB
+
+	ra, err := raft.NewRaft(config, (*fsm)(s), logStore, stableStore, snapshots, transport)
+	if err != nil {
+		return fmt.Errorf("new raft: %s", err)
+	}
+	s.raft = ra
+}
+
 func main() {
-	store := flag.String("store", "json", "json or gob")
+
+	/*store := flag.String("store", "json", "json or gob")
 	flag.Parse()
 
 	kv := NewKeyValue()
@@ -121,5 +175,5 @@ func main() {
 	kv.load()
 	fmt.Println(kv.version)
 	http.HandleFunc("/", kv.handler)
-	http.ListenAndServe(":8090", nil)
+	http.ListenAndServe(":8090", nil)*/
 }

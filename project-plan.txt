@@ -1,23 +1,34 @@
 KEY-VALUE STORE IMPLEMENTATION (get/set) (etcd)
 
-FEATURES:
----------
+LEARNING OBJECTIVES:
+-------------------
+
+1 - ability to run across multiple servers.
+2 - multiple users
+3 - atomic transactions
+4 - batch ops
+5 - persistance
+6 - security
+7 - data type
+8 - failure recovery
+
+DONE:
+----
 - Post a key-value. Stores it to a file and in-memory. File storage is JSON and GOB // STATUS: DONE
 - Get (read) from a key. // STATUS: DONE
-- Update a key-value by using the PUT. // STATUS: ONGOING
+
+ON-GOING:
+--------
+ -> <-
+
+23/2
+** TO HAVE MULTIPLE SERVERS **
+- To use raft to elect leader and followers when multiple server start
+- To replicate data from leader to followers on start
+- To replicate data from all nodes to all nodes
+- To optimize writes.
 
 NOTES:
 -----
 https://web.eecs.utk.edu/~azh/blog/morechallengingprojects.html
-
-persistant
-https://golang.org/pkg/encoding/gob/
-https://golang.org/pkg/encoding/json/
-
-choose the storage backend. we would need some kind of configuration. ability to change the backend without service restart ?
-
-Questions for the sessions
-
-- should the json file have one key one value or if one key has multiple values then should it be a combo of all the values. Currently its only the latest value
-
 
