@@ -17,3 +17,10 @@
 *.gob
 *.json
 personal-notes.txt
+*.mod
+*.sum
+*.db
+testing/
+[0-9]*/
+keyval
+

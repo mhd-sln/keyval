@@ -1,49 +1,55 @@
 package main
 
 import (
-	"encoding/gob"
+	"bytes"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
-
-	"github.com/hashicorp/raft"
-	"github.com/hashicorp/raft-boltdb"
 )
 
 type KeyValue struct {
-	InMem   map[string][]string
-	version int
-	stores  store
-	mu      sync.Mutex
+	//InMem        map[string]string
+	version      int
+	mu           sync.Mutex
+	RaftStore    *Store
+	redisLikeMap map[string]func(http.ResponseWriter, *http.Request)
 }
 
-func (kv *KeyValue) load() error {
-	kv.mu.Lock()
-	f, err := os.Open(kv.stores.filename())
+type jr struct {
+	Addr string
+	Id   string
+}
+
+func (kv *KeyValue) join(w http.ResponseWriter, r *http.Request) {
+	jr := jr{}
+	err := json.NewDecoder(r.Body).Decode(&jr)
 	if err != nil {
-		return err
+		log.Printf("Decoding error %s", err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
-	defer f.Close()
-	defer kv.mu.Unlock()
-
-	kv.version = 1000
-	err = kv.stores.decode(f, &kv.InMem)
-
-	return err
+	err = kv.RaftStore.Join(jr.Id, jr.Addr)
+	if err != nil {
+		log.Printf("Join error %s", err)
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.WriteHeader(200)
 }
 
-func (kv *KeyValue) handler(w http.ResponseWriter, r *http.Request) {
+func (kv *KeyValue) root(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case "GET":
 		kv.mu.Lock()
 		defer kv.mu.Unlock()
-		value := kv.InMem[strings.Trim(r.URL.Path, "/")]
+		value := kv.RaftStore.m[strings.Trim(r.URL.Path, "/")]
+
 		fmt.Fprintf(w, "Value = %s", value)
 	case "POST":
 		queries := r.URL.Query()
@@ -51,16 +57,11 @@ func (kv *KeyValue) handler(w http.ResponseWriter, r *http.Request) {
 		defer kv.mu.Unlock()
 		for qKey, qValue := range queries {
 			// The value is the latest value, shall we combine all the values
-			currVal := kv.InMem[qKey]
-			kv.InMem[qKey] = append(currVal, qValue...)
-		}
-		f, err := os.Create(kv.stores.filename())
-		err = kv.stores.encode(f, &kv.InMem)
-		if err != nil {
-			fmt.Println(err)
+			err := kv.RaftStore.Set(qKey, qValue[0])
+			log.Print(err)
 		}
 	case "PUT":
-		queries := r.URL.Query()
+		/*queries := r.URL.Query()
 		kv.mu.Lock()
 		kv.mu.Unlock()
 
@@ -71,7 +72,7 @@ func (kv *KeyValue) handler(w http.ResponseWriter, r *http.Request) {
 		err = kv.stores.encode(f, &kv.InMem)
 		if err != nil {
 			fmt.Println(err)
-		}
+		}*/
 	case "DELETE":
 		// todo
 	default:
@@ -80,100 +81,140 @@ func (kv *KeyValue) handler(w http.ResponseWriter, r *http.Request) {
 
 }
 
-type gobstore struct {
+func (kv *KeyValue) redislike(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query()
+	cmd := query.Get("cmd")
+	kv.redisLikeMap[cmd](w, r)
 }
 
-type jsonstore struct {
+func (kv *KeyValue) snapshot(w http.ResponseWriter, r *http.Request) {
+	future := kv.RaftStore.raft.Snapshot()
+	err := future.Error()
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	meta, rc, err := future.Open()
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	rc.Close()
+	err = json.NewEncoder(w).Encode(meta)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
 }
 
-func (gobstore) encode(w io.Writer, data interface{}) error {
-	return gob.NewEncoder(w).Encode(data)
+func join(joinAddr, raftAddr, nodeID string) error {
+	b, err := json.Marshal(map[string]string{"addr": raftAddr, "id": nodeID})
+	if err != nil {
+		return err
+	}
+	resp, err := http.Post(fmt.Sprintf("http://%s/join", joinAddr), "application-type/json", bytes.NewReader(b))
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	return nil
 }
 
-func (jsonstore) encode(w io.Writer, data interface{}) error {
-	return json.NewEncoder(w).Encode(data)
+func (kv *KeyValue) redisLikeGet(w http.ResponseWriter, r *http.Request) {
+	key := r.URL.Query().Get("key")
+	val := kv.RaftStore.m[key]
+	sVal, ok := val.(string)
+	if !ok {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	io.WriteString(w, sVal)
+}
+
+func (kv *KeyValue) redisLikeSet(w http.ResponseWriter, r *http.Request) {
+	key := r.URL.Query().Get("key")
+	val := r.URL.Query().Get("value")
+	kv.RaftStore.Set(key, val)
+	w.WriteHeader(200)
+}
+func (kv *KeyValue) redisLikeIncr(w http.ResponseWriter, r *http.Request) {
+	key := r.URL.Query().Get("key")
+	val, err := kv.RaftStore.incr(key)
+
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	w.WriteHeader(200)
+	io.WriteString(w, val)
+}
+
+// key=key1&value=bob&value=alice
+
+func (kv *KeyValue) redisLikeRPush(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	key := q.Get("key")
+	vals := q["value"]
+	kv.RaftStore.RPush(key, vals)
+	w.WriteHeader(200)
 }
 
 func NewKeyValue() *KeyValue {
-	var k KeyValue
-	k.InMem = make(map[string][]string)
-	return &k
-}
-
-func (jsonstore) decode(r io.Reader, data interface{}) error {
-	return json.NewDecoder(r).Decode(data)
-}
-
-func (gobstore) decode(r io.Reader, data interface{}) error {
-	return gob.NewDecoder(r).Decode(data)
-}
-
-func (gobstore) filename() string {
-	return "keyvalue.gob"
-}
-
-func (jsonstore) filename() string {
-	return "keyvalue.json"
-}
-
-type store interface {
-	decode(r io.Reader, data interface{}) error
-	encode(w io.Writer, data interface{}) error
-	filename() string
-}
-
-type Store struct {
-	RaftDir  string
-	RaftBind string
-	inmem    bool
-
-	mu sync.Mutex
-	m  map[string]string // The key-value store for the system.
-
-	raft *raft.Raft // The consensus mechanism
-
-	logger *log.Logger
-}
-
-func New(inmem bool) *Store {
-	return &Store{
-		m:      make(map[string]string),
-		inmem:  inmem,
-		logger: log.New(os.Stderr, "[store] ", log.LstdFlags),
+	kv := &KeyValue{}
+	kv.redisLikeMap = map[string]func(http.ResponseWriter, *http.Request){
+		"get":   kv.redisLikeGet,
+		"set":   kv.redisLikeSet,
+		"incr":  kv.redisLikeIncr,
+		"rpush": kv.redisLikeRPush,
+		// TODO : lrange and expires
 	}
-}
-
-func (s *Store) Open(enableSingle bool, localID string) error {
-	config := raft.DefaultConfig()
-	config.LocalID = raft.ServerID("123")
-
-	boltDB, err := raftboltdb.NewBoltStore(filepath.Join("/Users/salmanmanekia/dev/jaywren-golang/keyval", "raft.db"))
-	if err != nil {
-		fmt.Errorf("new bolt store: %s", err)
-	}
-	logStore := boltDB
-	stableStore := boltDB
-
-	ra, err := raft.NewRaft(config, (*fsm)(s), logStore, stableStore, snapshots, transport)
-	if err != nil {
-		return fmt.Errorf("new raft: %s", err)
-	}
-	s.raft = ra
+	return kv
 }
 
 func main() {
+	var nodeID string
+	var raftAddr string
+	var joinAddr string
+	var webAddr string
 
-	/*store := flag.String("store", "json", "json or gob")
+	flag.StringVar(&nodeID, "id", "", "Node ID")
+	flag.StringVar(&raftAddr, "raddr", "localhost:12000", "Set Raft bind address")
+	flag.StringVar(&joinAddr, "join", "", "Set join address, if any")
+	flag.StringVar(&webAddr, "webaddr", ":8090", "Web address for the app")
 	flag.Parse()
 
 	kv := NewKeyValue()
-	if *store == "gob" {
-		kv.stores = gobstore{}
-	} else {
-		kv.stores = jsonstore{}
+
+	raftDir := flag.Arg(0)
+	if raftDir == "" {
+		fmt.Fprintf(os.Stderr, "No Raft storage directory specified\n")
+		os.Exit(1)
 	}
-	kv.load()
-	fmt.Println(kv.version)
-	http.HandleFunc("/", kv.handler)
-	http.ListenAndServe(":8090", nil)*/
+	os.MkdirAll(raftDir, 0700)
+
+	s := New()
+	kv.RaftStore = s
+	s.RaftDir = raftDir
+	s.RaftBind = raftAddr
+
+	fmt.Print(s.Open(joinAddr != "", nodeID))
+
+	// If join was specified, make the join request.
+	if joinAddr != "" {
+		if err := join(joinAddr, raftAddr, nodeID); err != nil {
+			log.Fatalf("failed to join node at %s: %s", joinAddr, err.Error())
+		}
+	}
+
+	http.HandleFunc("/", kv.root)
+	http.HandleFunc("/join", kv.join)
+	http.HandleFunc("/redislike", kv.redislike)
+	http.HandleFunc("/snapshot", kv.snapshot)
+
+	err := http.ListenAndServe(webAddr, nil)
+	if err != nil {
+		fmt.Printf("http server error %s", err)
+	}
 }
