@@ -67,8 +67,8 @@ func Test_fsm_applyRPush(t *testing.T) {
 }
 
 func Test_Store_ListCommands(t *testing.T) {
-	granularity = time.Microsecond
 	s := New()
+	last = time.Now()
 	//s.RaftDir = "testing"
 	//s.RaftBind = "localhost:1234"
 	//err := s.Open(false, "testing")
@@ -144,7 +144,6 @@ func Test_Store_ListCommands(t *testing.T) {
 		assert.Equal(t, nil, err)
 		// if checked immediately then flag is 1
 		assert.Equal(t, flag, 1)
-		Sleep(1 * time.Second)
 		Sleep(1 * time.Second)
 
 		flag, err = s.Expire("key", 10)

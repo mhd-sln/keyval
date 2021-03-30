@@ -55,6 +55,13 @@ type fsmSnapshot struct {
 
 var _ raft.FSMSnapshot = &fsmSnapshot{}
 
+type ticker struct {
+	C chan time.Time
+}
+
+var tick *ticker = nil
+var last time.Time
+
 func (f *fsm) Apply(l *raft.Log) interface{} {
 	var c command
 	if err := json.Unmarshal(l.Data, &c); err != nil {
@@ -179,15 +186,17 @@ func (f *fsm) applyExpire(key string, seconds int) interface{} {
 	if !ok {
 		return 0
 	}
-
 	f.expires[key] = Now().Add(time.Second * time.Duration(seconds))
+	log.Printf("key would expire at %s ", f.expires[key])
 	return 1
 }
+
 func (s *Store) expireTick(next time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for k, v := range s.expires {
-		if v.After(next) {
+		log.Printf("expire %s %v", v, next)
+		if v.Sub(next)/time.Second == 0 {
 			delete(s.expires, k)
 			delete(s.m, k)
 		}
@@ -201,17 +210,8 @@ func (s *Store) expireLoop() {
 	}
 }
 
-var granularity = time.Second
-
-type ticker struct {
-	C chan time.Time
-}
-
-var tick *ticker = nil
-var last time.Time
-
 func Tick(t time.Duration) <-chan time.Time {
-	if granularity == time.Second {
+	if last.IsZero() {
 		return time.Tick(t)
 	}
 	tick = &ticker{
@@ -221,20 +221,27 @@ func Tick(t time.Duration) <-chan time.Time {
 }
 
 func Now() time.Time {
-	if granularity == time.Second {
+	if last.IsZero() {
 		return time.Now()
 	}
-	last = last.Add(granularity)
 	return last
 }
 
 // move to a time file
 func Sleep(d time.Duration) {
-	if granularity == time.Second {
+	log.Printf("Sleep with duration %s", d)
+	defer func() { log.Printf("Sleep returned %s", Now()) }()
+
+	if last.IsZero() {
 		time.Sleep(d)
 		return
 	}
-	last = last.Add(d)
+
+	last = last.Add(d / 2)
+
+	tick.C <- last
+
+	last = last.Add(d / 2)
 
 	tick.C <- last
 }
@@ -259,11 +266,11 @@ func (s *Store) jsonApply(c command) (raft.ApplyFuture, error) {
 	f := s.raft.Apply(b, raftTimeout)
 	return f, f.Error()
 }
+
 func (s *Store) Set(key, value string) error {
 	if s.raft.State() != raft.Leader {
 		return fmt.Errorf("not leader")
 	}
-
 	c := &command{
 		Op:    "set",
 		Key:   key,
@@ -273,7 +280,7 @@ func (s *Store) Set(key, value string) error {
 	return err
 }
 
-func (s *Store) incr(key string) (string, error) {
+func (s *Store) Incr(key string) (string, error) {
 	if s.raft.State() != raft.Leader {
 		return "", fmt.Errorf("not leader")
 	}

@@ -14,11 +14,10 @@ import (
 )
 
 type KeyValue struct {
-	//InMem        map[string]string
-	version      int
-	mu           sync.Mutex
-	RaftStore    *Store
-	redisLikeMap map[string]func(http.ResponseWriter, *http.Request)
+	version   int
+	mu        sync.Mutex
+	RaftStore *Store
+	cmdsFn    map[string]func(http.ResponseWriter, *http.Request)
 }
 
 type jr struct {
@@ -46,45 +45,23 @@ func (kv *KeyValue) join(w http.ResponseWriter, r *http.Request) {
 func (kv *KeyValue) root(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case "GET":
+		// GET without REST API ? something similar to redis. With that we would not need root.
 		kv.mu.Lock()
 		defer kv.mu.Unlock()
 		value := kv.RaftStore.m[strings.Trim(r.URL.Path, "/")]
-
 		fmt.Fprintf(w, "Value = %s", value)
-	case "POST":
-		queries := r.URL.Query()
-		kv.mu.Lock()
-		defer kv.mu.Unlock()
-		for qKey, qValue := range queries {
-			// The value is the latest value, shall we combine all the values
-			err := kv.RaftStore.Set(qKey, qValue[0])
-			log.Print(err)
-		}
-	case "PUT":
-		/*queries := r.URL.Query()
-		kv.mu.Lock()
-		kv.mu.Unlock()
 
-		for qKey, qValue := range queries {
-			kv.InMem[qKey] = qValue
-		}
-		f, err := os.Create(kv.stores.filename())
-		err = kv.stores.encode(f, &kv.InMem)
-		if err != nil {
-			fmt.Println(err)
-		}*/
 	case "DELETE":
 		// todo
 	default:
 		fmt.Fprintf(w, "Sorry, only GET and POST methods are supported.")
 	}
-
 }
 
-func (kv *KeyValue) redislike(w http.ResponseWriter, r *http.Request) {
+func (kv *KeyValue) parseCmd(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
 	cmd := query.Get("cmd")
-	kv.redisLikeMap[cmd](w, r)
+	kv.cmdsFn[cmd](w, r)
 }
 
 func (kv *KeyValue) snapshot(w http.ResponseWriter, r *http.Request) {
@@ -122,7 +99,7 @@ func join(joinAddr, raftAddr, nodeID string) error {
 	return nil
 }
 
-func (kv *KeyValue) redisLikeGet(w http.ResponseWriter, r *http.Request) {
+func (kv *KeyValue) get(w http.ResponseWriter, r *http.Request) {
 	key := r.URL.Query().Get("key")
 	val := kv.RaftStore.m[key]
 	sVal, ok := val.(string)
@@ -133,15 +110,15 @@ func (kv *KeyValue) redisLikeGet(w http.ResponseWriter, r *http.Request) {
 	io.WriteString(w, sVal)
 }
 
-func (kv *KeyValue) redisLikeSet(w http.ResponseWriter, r *http.Request) {
+func (kv *KeyValue) set(w http.ResponseWriter, r *http.Request) {
 	key := r.URL.Query().Get("key")
 	val := r.URL.Query().Get("value")
 	kv.RaftStore.Set(key, val)
 	w.WriteHeader(200)
 }
-func (kv *KeyValue) redisLikeIncr(w http.ResponseWriter, r *http.Request) {
+func (kv *KeyValue) incr(w http.ResponseWriter, r *http.Request) {
 	key := r.URL.Query().Get("key")
-	val, err := kv.RaftStore.incr(key)
+	val, err := kv.RaftStore.Incr(key)
 
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
@@ -153,7 +130,7 @@ func (kv *KeyValue) redisLikeIncr(w http.ResponseWriter, r *http.Request) {
 
 // key=key1&value=bob&value=alice
 
-func (kv *KeyValue) redisLikeRPush(w http.ResponseWriter, r *http.Request) {
+func (kv *KeyValue) rPush(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	key := q.Get("key")
 	vals := q["value"]
@@ -163,11 +140,11 @@ func (kv *KeyValue) redisLikeRPush(w http.ResponseWriter, r *http.Request) {
 
 func NewKeyValue() *KeyValue {
 	kv := &KeyValue{}
-	kv.redisLikeMap = map[string]func(http.ResponseWriter, *http.Request){
-		"get":   kv.redisLikeGet,
-		"set":   kv.redisLikeSet,
-		"incr":  kv.redisLikeIncr,
-		"rpush": kv.redisLikeRPush,
+	kv.cmdsFn = map[string]func(http.ResponseWriter, *http.Request){
+		"get":   kv.get,
+		"set":   kv.set,
+		"incr":  kv.incr,
+		"rpush": kv.rPush,
 		// TODO : lrange and expires
 	}
 	return kv
@@ -210,7 +187,7 @@ func main() {
 
 	http.HandleFunc("/", kv.root)
 	http.HandleFunc("/join", kv.join)
-	http.HandleFunc("/redislike", kv.redislike)
+	http.HandleFunc("/kv", kv.parseCmd)
 	http.HandleFunc("/snapshot", kv.snapshot)
 
 	err := http.ListenAndServe(webAddr, nil)
