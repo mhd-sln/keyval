@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -80,6 +79,8 @@ func (f *fsm) Apply(l *raft.Log) interface{} {
 		return f.applyLRange(c.Key, c.Start, c.End)
 	case "expire":
 		return f.applyExpire(c.Key, c.Seconds)
+	case "ttl":
+		return f.applyTTL(c.Key)
 	default:
 		panic(fmt.Sprintf("unrecognized command op: %s", c.Op))
 	}
@@ -91,7 +92,6 @@ func (f *fsm) Snapshot() (raft.FSMSnapshot, error) {
 	defer f.mu.Unlock()
 	log.Println("snapshot is called")
 	// Clone the map.
-	// TODO: do we need to deep copy
 	o := make(map[string]interface{})
 	for k, v := range f.m {
 		o[k] = v
@@ -114,37 +114,41 @@ func (f *fsm) Restore(rc io.ReadCloser) error {
 	return nil
 }
 
-func (f *fsm) applyIncr(key string) interface{} {
+func (f *fsm) applyIncr(key string) *OurResponse {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	i, _ := strconv.Atoi(f.m[key].(string))
 	f.m[key] = strconv.Itoa(i + 1)
 	log.Printf("applyincr key %s and value %s", key, f.m[key])
-	return f.m[key]
+	return &OurResponse{val: f.m[key].(string)}
 }
 
-func (f *fsm) applySet(key, value string) interface{} {
+func (f *fsm) applySet(key, value string) *OurResponse {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	log.Printf("applyset key %s and value %s", key, value)
 	f.m[key] = value
-	return nil
+	return &OurResponse{}
 }
 
-func (f *fsm) applyDelete(key string) interface{} {
+func (f *fsm) applyDelete(key string) *OurResponse {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	delete(f.m, key)
-	return nil
+	if _, ok := f.m[key]; ok {
+		delete(f.m, key)
+		return &OurResponse{numOfAffectedKeys: 1}
+
+	}
+	return &OurResponse{numOfAffectedKeys: 0}
 }
 
 // cmd="rpush&key=&value=""
 // "":
-func (f *fsm) applyRPush(key string, val []string) interface{} {
+func (f *fsm) applyRPush(key string, val []string) *OurResponse {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if len(val) == 0 {
-		return fmt.Errorf("(error) ERR wrong number of arguments for 'rpush' command")
+		return &OurResponse{err: fmt.Errorf("(error) ERR wrong number of arguments for 'rpush' command")}
 	}
 
 	if _, ok := f.m[key]; !ok {
@@ -153,19 +157,20 @@ func (f *fsm) applyRPush(key string, val []string) interface{} {
 
 	v, ok := f.m[key].([]string)
 	if !ok {
-		return fmt.Errorf("(error) WRONGTYPE Operation against a key holding the wrong kind of value")
+		fmt.Println("Here....")
+		return &OurResponse{err: fmt.Errorf("(error) WRONGTYPE Operation against a key holding the wrong kind of value")}
 	}
 	v = append(v, val...)
 	f.m[key] = v
-	return len(v)
+	return &OurResponse{length: len(v)}
 }
 
-func (f *fsm) applyLRange(key string, start int, end int) interface{} {
+func (f *fsm) applyLRange(key string, start int, end int) *OurResponse {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	v, ok := f.m[key].([]string)
 	if !ok {
-		return fmt.Errorf("(error) WRONGTYPE Operation against a key holding the wrong kind of value")
+		return &OurResponse{err: fmt.Errorf("(error) WRONGTYPE Operation against a key holding the wrong kind of value")}
 	}
 	if start < 0 {
 		start = 0
@@ -176,19 +181,33 @@ func (f *fsm) applyLRange(key string, start int, end int) interface{} {
 	if start > len(v) {
 		start = len(v)
 	}
-	return v[start : end+1]
+	return &OurResponse{elements: v[start : end+1]}
 }
 
-func (f *fsm) applyExpire(key string, seconds int) interface{} {
+func (f *fsm) applyExpire(key string, seconds int) *OurResponse {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	_, ok := f.m[key]
 	if !ok {
-		return 0
+		return &OurResponse{}
 	}
 	f.expires[key] = Now().Add(time.Second * time.Duration(seconds))
 	log.Printf("key would expire at %s ", f.expires[key])
-	return 1
+	return &OurResponse{wasKeySet: true}
+}
+
+func (f *fsm) applyTTL(key string) *OurResponse {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, ok := f.m[key]
+	if !ok {
+		return &OurResponse{ttl: -2}
+	}
+	et, ok := f.expires[key]
+	if !ok {
+		return &OurResponse{ttl: -1}
+	}
+	return &OurResponse{ttl: (int)(et.Sub(Now()) / time.Second)}
 }
 
 func (s *Store) expireTick(next time.Time) {
@@ -237,11 +256,9 @@ func Sleep(d time.Duration) {
 		return
 	}
 
-	last = last.Add(d / 2)
+	last = last.Add(d)
 
 	tick.C <- last
-
-	last = last.Add(d / 2)
 
 	tick.C <- last
 }
@@ -257,14 +274,33 @@ func New() *Store {
 	return s
 }
 
-func (s *Store) jsonApply(c command) (raft.ApplyFuture, error) {
+type OurResponse struct {
+	val               string
+	numOfAffectedKeys int
+	wasKeySet         bool
+	length            int
+	ttl               int
+	elements          []string
+	err               error
+}
+
+func (s *Store) jsonApply(c command) (*OurResponse, error) {
 	b, err := json.Marshal(c)
 	if err != nil {
 		return nil, err
 	}
 
 	f := s.raft.Apply(b, raftTimeout)
-	return f, f.Error()
+
+	if f.Error() != nil {
+		return nil, f.Error()
+	}
+
+	r := f.Response().(*OurResponse)
+	if r.err != nil {
+		return r, r.err
+	}
+	return r, nil
 }
 
 func (s *Store) Set(key, value string) error {
@@ -297,7 +333,7 @@ func (s *Store) Incr(key string) (string, error) {
 		Key: key,
 	}
 	f, err := s.jsonApply(c)
-	return f.Response().(string), err
+	return f.val, err
 }
 
 func (s *Store) RPush(key string, val []string) (int, error) {
@@ -310,8 +346,12 @@ func (s *Store) RPush(key string, val []string) (int, error) {
 		Params: val,
 	}
 	f, err := s.jsonApply(c)
-	return f.Response().(int), err
+	fmt.Printf("f %#v \n", f)
+	if err != nil {
+		return -1, err
+	}
 
+	return f.length, nil
 }
 
 func (s *Store) LRange(key string, start int, end int) ([]string, error) {
@@ -325,19 +365,12 @@ func (s *Store) LRange(key string, start int, end int) ([]string, error) {
 		End:   end,
 	}
 	f, err := s.jsonApply(c)
-	switch v := f.Response().(type) {
-	case []string:
-		return v, err
-	case error:
-		return nil, v
-	default:
-		return nil, errors.New("unhandled type")
-	}
+	return f.elements, err
 }
 
-func (s *Store) Expire(key string, seconds int) (int, error) {
+func (s *Store) Expire(key string, seconds int) (bool, error) {
 	if s.raft.State() != raft.Leader {
-		return -1, fmt.Errorf("not leader")
+		return false, fmt.Errorf("not leader")
 	}
 	c := command{
 		Op:      "expire",
@@ -345,7 +378,19 @@ func (s *Store) Expire(key string, seconds int) (int, error) {
 		Seconds: seconds,
 	}
 	f, err := s.jsonApply(c)
-	return f.Response().(int), err
+	return f.wasKeySet, err
+}
+
+func (s *Store) TTL(key string) (int, error) {
+	if s.raft.State() != raft.Leader {
+		return -1, fmt.Errorf("not leader")
+	}
+	c := command{
+		Op:  "ttl",
+		Key: key,
+	}
+	f, err := s.jsonApply(c)
+	return f.ttl, err
 }
 
 /*

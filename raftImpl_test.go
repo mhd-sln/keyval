@@ -2,6 +2,9 @@ package main
 
 import (
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"testing"
 	"time"
@@ -22,7 +25,7 @@ func Test_fsm_applyRPush(t *testing.T) {
 		name   string
 		fields fields
 		args   args
-		want   interface{}
+		want   *OurResponse
 	}{
 		{
 			name: "addingone emptylist",
@@ -32,7 +35,7 @@ func Test_fsm_applyRPush(t *testing.T) {
 			args: args{
 				val: []string{"one"},
 			},
-			want: 1,
+			want: &OurResponse{length: 1},
 		},
 		{
 			name: "adding to existing list",
@@ -44,14 +47,14 @@ func Test_fsm_applyRPush(t *testing.T) {
 			args: args{
 				val: []string{"two"},
 			},
-			want: 2,
+			want: &OurResponse{length: 2},
 		},
 		{
 			name: "emptyname emptylist",
 			fields: fields{
 				m: map[string]interface{}{},
 			},
-			want: fmt.Errorf("(error) ERR wrong number of arguments for 'rpush' command"),
+			want: &OurResponse{err: fmt.Errorf("(error) ERR wrong number of arguments for 'rpush' command")},
 		},
 	}
 	for _, tt := range tests {
@@ -66,8 +69,8 @@ func Test_fsm_applyRPush(t *testing.T) {
 	}
 }
 
-func Test_Store_ListCommands(t *testing.T) {
-	s := New()
+func getTestStore(t *testing.T) (s *Store) {
+	s = New()
 	last = time.Now()
 	//s.RaftDir = "testing"
 	//s.RaftBind = "localhost:1234"
@@ -89,16 +92,20 @@ func Test_Store_ListCommands(t *testing.T) {
 	ra.BootstrapCluster(configuration)
 
 	s.raft = ra
-	defer s.raft.Shutdown()
-	/*for s.raft.Leader() == "" {
-		time.Sleep(500 * time.Millisecond)
-	}*/
+	//defer s.raft.Shutdown()
 	<-s.raft.LeaderCh()
+	return s
+}
+
+func Test_Store_ListCommands(t *testing.T) {
+	s := getTestStore(t)
+	defer s.raft.Shutdown()
 
 	t.Run("RPush returns 2", func(t *testing.T) {
 		c, err := s.RPush("key", []string{"val1", "val2"})
 		assert.Equal(t, nil, err)
 		assert.Equal(t, c, 2)
+
 	})
 
 	t.Run("second RPush returns 3", func(t *testing.T) {
@@ -140,15 +147,63 @@ func Test_Store_ListCommands(t *testing.T) {
 	})
 
 	t.Run("EXPIRES the key in 1 second", func(t *testing.T) {
-		flag, err := s.Expire("key", 1)
+		tm := 1
+		flag, err := s.Expire("key", tm)
 		assert.Equal(t, nil, err)
 		// if checked immediately then flag is 1
-		assert.Equal(t, flag, 1)
-		Sleep(1 * time.Second)
+		assert.Equal(t, flag, true)
+		Sleep((time.Duration(tm)) * time.Second)
 
 		flag, err = s.Expire("key", 10)
 		//if checked after 1 sec then flag is 0
-		assert.Equal(t, flag, 0)
+		assert.Equal(t, flag, false)
 	})
 
+	t.Run("TTL for a key after 1 second that expires in 2 second is 1 second", func(t *testing.T) {
+		tm := 2
+		err := s.Set("key", "any")
+		assert.Equal(t, nil, err)
+
+		flag, err := s.Expire("key", tm)
+		assert.Equal(t, nil, err)
+		assert.Equal(t, flag, true)
+
+		ttl, err := s.TTL("key")
+		assert.Equal(t, ttl, 2)
+
+		Sleep((time.Duration(1)) * time.Second)
+		ttl, err = s.TTL("key")
+		assert.Equal(t, ttl, 1)
+	})
+
+}
+
+func Test_WEB_API(t *testing.T) {
+	s := getTestStore(t)
+	defer s.raft.Shutdown()
+	kv := NewKeyValue()
+	kv.RaftStore = s
+	ts := httptest.NewServer(http.HandlerFunc(kv.parseCmd))
+	defer ts.Close()
+
+	t.Run("SETS a value", func(t *testing.T) {
+		resp, err := http.Get(ts.URL + "?cmd=set&key=key1&value=value1")
+		assert.Equal(t, nil, err)
+		assert.Equal(t, 200, resp.StatusCode)
+		assert.Equal(t, s.m["key1"], "value1")
+	})
+
+	t.Run("RPush a value", func(t *testing.T) {
+		resp, err := http.Get(ts.URL + "?cmd=rpush&key=key2&value=value2&value=value3")
+		assert.Equal(t, nil, err)
+		assert.Equal(t, 200, resp.StatusCode)
+		assert.Equal(t, s.m["key2"], []string{"value2", "value3"})
+	})
+
+	t.Run("RPush a value to a existing key with a wrong type", func(t *testing.T) {
+		resp, _ := http.Get(ts.URL + "?cmd=rpush&key=key1&value=value2&value=value3")
+		body, _ := io.ReadAll(resp.Body)
+		assert.Equal(t, "(error) WRONGTYPE Operation against a key holding the wrong kind of value\n", string(body))
+		assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	})
 }

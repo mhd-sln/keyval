@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -20,20 +21,20 @@ type KeyValue struct {
 	cmdsFn    map[string]func(http.ResponseWriter, *http.Request)
 }
 
-type jr struct {
+type Node struct {
 	Addr string
 	Id   string
 }
 
 func (kv *KeyValue) join(w http.ResponseWriter, r *http.Request) {
-	jr := jr{}
-	err := json.NewDecoder(r.Body).Decode(&jr)
+	n := Node{}
+	err := json.NewDecoder(r.Body).Decode(&n)
 	if err != nil {
 		log.Printf("Decoding error %s", err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	err = kv.RaftStore.Join(jr.Id, jr.Addr)
+	err = kv.RaftStore.Join(n.Id, n.Addr)
 	if err != nil {
 		log.Printf("Join error %s", err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -134,18 +135,47 @@ func (kv *KeyValue) rPush(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	key := q.Get("key")
 	vals := q["value"]
-	kv.RaftStore.RPush(key, vals)
+	f, err := kv.RaftStore.RPush(key, vals)
+	fmt.Printf("what is errr %v", err)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 	w.WriteHeader(200)
+	fmt.Fprintf(w, "%d", f)
+}
+
+func (kv *KeyValue) expire(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	key := q.Get("key")
+	expire, err := strconv.Atoi(q.Get("expire"))
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	res, _ := kv.RaftStore.Expire(key, expire)
+	w.WriteHeader(200)
+	fmt.Fprint(w, res)
+}
+
+func (kv *KeyValue) ttl(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	key := q.Get("key")
+	res, _ := kv.RaftStore.TTL(key)
+	w.WriteHeader(200)
+	io.WriteString(w, strconv.Itoa(res))
 }
 
 func NewKeyValue() *KeyValue {
 	kv := &KeyValue{}
 	kv.cmdsFn = map[string]func(http.ResponseWriter, *http.Request){
-		"get":   kv.get,
-		"set":   kv.set,
-		"incr":  kv.incr,
-		"rpush": kv.rPush,
-		// TODO : lrange and expires
+		"get":    kv.get,
+		"set":    kv.set,
+		"incr":   kv.incr,
+		"rpush":  kv.rPush,
+		"expire": kv.expire,
+		"ttl":    kv.ttl,
+		// TODO : lrange and expire
 	}
 	return kv
 }
